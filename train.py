@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import argparse
-from datetime import date
+from datetime import datetime
 import os
 import sys
 import tensorflow as tf
@@ -80,7 +80,6 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
         tensorboard_callback = keras.callbacks.TensorBoard(
             log_dir=args.tensorboard_dir,
             histogram_freq=0,
-            batch_size=args.batch_size,
             write_graph=True,
             write_grads=False,
             write_images=False,
@@ -97,7 +96,7 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
             evaluation = Evaluate(validation_generator, prediction_model, tensorboard=tensorboard_callback)
         else:
             from eval.pascal import Evaluate
-            evaluation = Evaluate(validation_generator, prediction_model, tensorboard=tensorboard_callback)
+            evaluation = Evaluate(validation_generator, prediction_model, tensorboard=tensorboard_callback, weighted_average=True)
         callbacks.append(evaluation)
 
     # save the model
@@ -118,16 +117,16 @@ def create_callbacks(training_model, prediction_model, validation_generator, arg
         )
         callbacks.append(checkpoint)
 
-    # callbacks.append(keras.callbacks.ReduceLROnPlateau(
-    #     monitor='loss',
-    #     factor=0.1,
-    #     patience=2,
-    #     verbose=1,
-    #     mode='auto',
-    #     min_delta=0.0001,
-    #     cooldown=0,
-    #     min_lr=0
-    # ))
+    callbacks.append(keras.callbacks.ReduceLROnPlateau(
+        monitor = 'val_loss' if args.compute_val_loss else 'loss',
+        factor = 0.1,
+        patience = 4,
+        verbose = 1,
+        mode = 'auto',
+        min_delta = 0.0001,
+        cooldown = 0,
+        min_lr = 1e-6,
+    ))
 
     return callbacks
 
@@ -149,8 +148,28 @@ def create_generators(args):
 
     # create random transform generator for augmenting training data
     if args.random_transform:
-        misc_effect = MiscEffect()
-        visual_effect = VisualEffect()
+        misc_effect = MiscEffect(
+            multi_scale_prob=0.5,
+            rotate_prob=0,
+            flip_prob=0.5,
+            crop_prob=0.0,
+            translate_prob=0.5,
+            border_value=(0, 0, 0),
+        )
+        visual_effect = VisualEffect(
+            color_factor=None,
+            contrast_factor=None,
+            brightness_factor=None,
+            sharpness_factor=None,
+            color_prob=0,
+            contrast_prob=0.5,
+            brightness_prob=0.5,
+            sharpness_prob=0.5,
+            autocontrast_prob=0,
+            equalize_prob=0,
+            solarize_prob=0,
+            solarize_threshold=128.,
+        )
     else:
         misc_effect = None
         visual_effect = None
@@ -242,7 +261,7 @@ def parse_args(args):
     """
     Parse the arguments.
     """
-    today = str(date.today())
+    today = datetime.now().strftime('%Y%m%d-%H%M%S')
     parser = argparse.ArgumentParser(description='Simple training script for training a RetinaNet network.')
     subparsers = parser.add_subparsers(help='Arguments for specific dataset types.', dest='dataset_type')
     subparsers.required = True
@@ -266,11 +285,12 @@ def parse_args(args):
     parser.add_argument('--freeze-bn', help='Freeze training of BatchNormalization layers.', action='store_true')
     parser.add_argument('--weighted-bifpn', help='Use weighted BiFPN', action='store_true')
 
+    parser.add_argument('--learning-rate', help='Start learning rate.', default=1e-3, type=float)
     parser.add_argument('--batch-size', help='Size of the batches.', default=1, type=int)
     parser.add_argument('--phi', help='Hyper parameter phi', default=0, type=int, choices=(0, 1, 2, 3, 4, 5, 6))
     parser.add_argument('--gpu', help='Id of the GPU to use (as reported by nvidia-smi).')
     parser.add_argument('--epochs', help='Number of epochs to train.', type=int, default=50)
-    parser.add_argument('--steps', help='Number of steps per epoch.', type=int, default=10000)
+    parser.add_argument('--steps', help='Number of steps per epoch.', type=int, default=None)
     parser.add_argument('--snapshot-path',
                         help='Path to store snapshots of models during training',
                         default='checkpoints/{}'.format(today))
@@ -310,13 +330,14 @@ def main(args=None):
 
     # K.set_session(get_session())
 
-    model, prediction_model = efficientdet(args.phi,
-                                           num_classes=num_classes,
-                                           num_anchors=num_anchors,
-                                           weighted_bifpn=args.weighted_bifpn,
-                                           freeze_bn=args.freeze_bn,
-                                           detect_quadrangle=args.detect_quadrangle
-                                           )
+    model, prediction_model = efficientdet(
+        args.phi,
+        num_classes=num_classes,
+        num_anchors=num_anchors,
+        weighted_bifpn=args.weighted_bifpn,
+        freeze_bn=args.freeze_bn,
+        detect_quadrangle=args.detect_quadrangle,
+    )
     # load pretrained weights
     if args.snapshot:
         if args.snapshot == 'imagenet':
@@ -342,10 +363,17 @@ def main(args=None):
         model = keras.utils.multi_gpu_model(model, gpus=list(map(int, args.gpu.split(','))))
 
     # compile model
-    model.compile(optimizer=Adam(lr=1e-3), loss={
-        'regression': smooth_l1_quad() if args.detect_quadrangle else smooth_l1(),
-        'classification': focal()
-    }, )
+    model.compile(
+        optimizer=Adam(lr=args.learning_rate),
+        loss={
+            'regression': smooth_l1_quad() if args.detect_quadrangle else smooth_l1(),
+            'classification': focal()
+        },
+        loss_weights = {
+            'regression': 1,
+            'classification': 1,
+        }
+    )
 
     # print(model.summary())
 
@@ -362,18 +390,21 @@ def main(args=None):
     elif args.compute_val_loss and validation_generator is None:
         raise ValueError('When you have no validation data, you should not specify --compute-val-loss.')
 
+    # plot model
+    # keras.utils.plot_model(model, to_file='model.png', show_shapes=True, expand_nested=False, dpi=300)
+
     # start training
-    return model.fit_generator(
-        generator=train_generator,
-        steps_per_epoch=args.steps,
-        initial_epoch=0,
-        epochs=args.epochs,
-        verbose=1,
-        callbacks=callbacks,
-        workers=args.workers,
-        use_multiprocessing=args.multiprocessing,
-        max_queue_size=args.max_queue_size,
-        validation_data=validation_generator
+    return model.fit(
+        x = train_generator,
+        steps_per_epoch = args.steps,
+        initial_epoch = 0,
+        epochs = args.epochs,
+        verbose = 1,
+        callbacks = callbacks,
+        workers = args.workers,
+        use_multiprocessing = args.multiprocessing,
+        max_queue_size = args.max_queue_size,
+        validation_data = validation_generator,
     )
 
 

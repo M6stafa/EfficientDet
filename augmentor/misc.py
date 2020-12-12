@@ -137,7 +137,7 @@ def multi_scale(image, annotations, prob=1.):
     if random_prob < (1 - prob):
         return image, annotations
     h, w = image.shape[:2]
-    scale = np.random.choice(np.arange(0.7, 1.4, 0.1))
+    scale = np.random.choice(np.arange(0.8, 1.6, 0.1))
     nh, nw = int(round(h * scale)), int(round(w * scale))
     image = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
     bboxes = annotations['bboxes']

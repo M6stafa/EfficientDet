@@ -107,6 +107,7 @@ venv.bak/
 datasets/
 logs/
 checkpoints/
+inferences/
 *.npy
 !utils/compute_overlap.cpython-36m-x86_64-linux-gnu.so
 tests/

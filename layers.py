@@ -250,7 +250,7 @@ class FilterDetections(keras.layers.Layer):
             class_specific_filter=True,
             nms_threshold=0.5,
             score_threshold=0.01,
-            max_detections=100,
+            max_detections=250,
             parallel_iterations=32,
             detect_quadrangle=False,
             **kwargs

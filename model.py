@@ -7,6 +7,8 @@ from functools import reduce
 # from keras_ import EfficientNetB3, EfficientNetB4, EfficientNetB5, EfficientNetB6
 
 import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import backend as K
 from tensorflow.keras import layers
 from tensorflow.keras import initializers
 from tensorflow.keras import models
@@ -344,15 +346,14 @@ class BoxNet(models.Model):
         self.reshape = layers.Reshape((-1, num_values))
         self.level = 0
 
-    def call(self, inputs, **kwargs):
-        feature, level = inputs
+    def call(self, inputs, level, **kwargs):
+        feature = inputs
         for i in range(self.depth):
             feature = self.convs[i](feature)
-            feature = self.bns[i][self.level](feature)
+            feature = self.bns[i][level](feature)
             feature = self.relu(feature)
         outputs = self.head(feature)
         outputs = self.reshape(outputs)
-        self.level += 1
         return outputs
 
 
@@ -403,16 +404,15 @@ class ClassNet(models.Model):
         self.activation = layers.Activation('sigmoid')
         self.level = 0
 
-    def call(self, inputs, **kwargs):
-        feature, level = inputs
+    def call(self, inputs, level, **kwargs):
+        feature = inputs
         for i in range(self.depth):
             feature = self.convs[i](feature)
-            feature = self.bns[i][self.level](feature)
+            feature = self.bns[i][level](feature)
             feature = self.relu(feature)
         outputs = self.head(feature)
         outputs = self.reshape(outputs)
         outputs = self.activation(outputs)
-        self.level += 1
         return outputs
 
 
@@ -440,16 +440,22 @@ def efficientdet(phi, num_classes=20, num_anchors=9, weighted_bifpn=False, freez
                      detect_quadrangle=detect_quadrangle, name='box_net')
     class_net = ClassNet(w_head, d_head, num_classes=num_classes, num_anchors=num_anchors,
                          separable_conv=separable_conv, freeze_bn=freeze_bn, name='class_net')
-    classification = [class_net([feature, i]) for i, feature in enumerate(fpn_features)]
+    classification = [class_net(feature, i) for i, feature in enumerate(fpn_features)]
     classification = layers.Concatenate(axis=1, name='classification')(classification)
-    regression = [box_net([feature, i]) for i, feature in enumerate(fpn_features)]
+    regression = [box_net(feature, i) for i, feature in enumerate(fpn_features)]
     regression = layers.Concatenate(axis=1, name='regression')(regression)
 
     model = models.Model(inputs=[image_input], outputs=[classification, regression], name='efficientdet')
 
     # apply predicted regression to anchors
     anchors = anchors_for_shape((input_size, input_size), anchor_params=anchor_parameters)
-    anchors_input = np.expand_dims(anchors, axis=0)
+    def get_anchors_input(input_batch):
+        tf_constant = K.constant(np.expand_dims(anchors, axis=0))
+        batch_size = K.shape(input_batch)[0]
+        tiled_constant = K.tile(tf_constant, (batch_size, 1, 1))
+        return tiled_constant
+    anchors_input = layers.Lambda(get_anchors_input)(regression)
+
     boxes = RegressBoxes(name='boxes')([anchors_input, regression[..., :4]])
     boxes = ClipBoxes(name='clipped_boxes')([image_input, boxes])
 
@@ -458,12 +464,14 @@ def efficientdet(phi, num_classes=20, num_anchors=9, weighted_bifpn=False, freez
         detections = FilterDetections(
             name='filtered_detections',
             score_threshold=score_threshold,
-            detect_quadrangle=True
+            detect_quadrangle=True,
+            class_specific_filter=False,
         )([boxes, classification, regression[..., 4:8], regression[..., 8]])
     else:
         detections = FilterDetections(
             name='filtered_detections',
-            score_threshold=score_threshold
+            score_threshold=score_threshold,
+            class_specific_filter=False,
         )([boxes, classification])
 
     prediction_model = models.Model(inputs=[image_input], outputs=detections, name='efficientdet_p')
