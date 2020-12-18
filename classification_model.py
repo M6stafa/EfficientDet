@@ -57,9 +57,12 @@ def get_image_crops(generator, detections, annotations, image_index, crop_size, 
                     continue  # skip this crop, because we don't know the label
                 labels.append(int(annotations_label[assigned_annotation]))
             else:  # Duplicate
-                labels.append(generator.num_classes() - 1)
-        else:  # No overlap with annotation
-            continue
+                if max_overlap >= iou_threshold + 0.15:
+                    labels.append(int(annotations_label[assigned_annotation]))
+                else:
+                    labels.append(generator.num_classes() - 1)
+        else:  # No enough overlap with annotations
+            labels.append(generator.num_classes() - 1)
 
         crops.append(crop)
 
@@ -84,11 +87,16 @@ def create_model(input_shape, num_classes, verbose=True):
 
     x = K.applications.xception.preprocess_input(x)
     core = K.applications.Xception(**core_kwargs)
-    set_trainable(core, 'block11_sepconv3_bn')
+    set_trainable(core, 'block10_sepconv3_bn')
 
     x = core(x, training=False)
 
     x = KL.GlobalAvgPool2D(name='GlobalAvgPool2D')(x)
+
+    x = KL.Dense(1024)(x)
+    x = KL.BatchNormalization()(x)
+    x = KL.ReLU()(x)
+    x = KL.Dropout(0.4)(x)
 
     outputs = KL.Dense(num_classes, KL.Activation('softmax'), name='output')(x)
 
@@ -102,88 +110,83 @@ def create_model(input_shape, num_classes, verbose=True):
 
 
 class CropSequence(K.utils.Sequence):
-    def __init__(self, base_path, num_classes, batch_size, augmenter=None, calc_weights=False):
+    def __init__(self, base_path, num_classes, batch_size, augmenter=None, calc_weights=False, ignore_labels=[]):
         self.num_classes = num_classes
         self.batch_size = batch_size
         self.augmenter = augmenter
 
-        object_per_class = np.zeros((num_classes,))
         self.x = []
         self.y = []
+        self.objects_per_class = np.zeros((num_classes,), dtype=np.int)
+
         for label in range(num_classes):
+            if label in ignore_labels: continue
+
             label_path = osp.join(base_path, str(label))
-            label_images = [osp.join(label_path, f) for f in listdir(label_path) if osp.isfile(osp.join(label_path, f))]
-            if label in [2]:
-                label_images = random.sample(label_images, 25)
+            label_images = [imread(osp.join(label_path, f)) for f in listdir(label_path) if osp.isfile(osp.join(label_path, f))]
+
             self.x += label_images
             self.y += [label for _ in range(len(label_images))]
-            object_per_class[label] = len(label_images)
+            self.objects_per_class[label] = len(label_images)
 
-        self.x = np.array(self.x)
+        self.x = np.array(self.x, dtype='uint8')
         self.y = np.array(self.y, dtype='uint8')
 
+        self.indexes = np.arange(0, len(self.x), 1, dtype=np.int)
+        np.random.shuffle(self.indexes)
+
+        self.class_weights = np.ones((num_classes,), dtype=np.float)
         if calc_weights:
-            big_class = np.argmax(object_per_class)
-            self.weights = np.full((num_classes,), 2.0)
-            self.weights[big_class] = np.min(object_per_class) / object_per_class[big_class]
-            # self.weights = np.sum(self.weights) / self.weights
-            # self.weights /= np.sum(self.weights)
-        else:
-            self.weights = np.ones((num_classes,))
+            non_zero_idx = self.objects_per_class > 0
+            self.class_weights[non_zero_idx] = np.max(self.objects_per_class) / self.objects_per_class[non_zero_idx]
 
 
     def __len__(self):
         return int(np.ceil(len(self.x) / self.batch_size))
 
 
+    def on_epoch_end(self):
+        np.random.shuffle(self.indexes)
+
+
     def __getitem__(self, idx):
-        batch_x = self.x[idx * self.batch_size:(idx + 1) * self.batch_size]
-        batch_y = self.y[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_idx = self.indexes[idx * self.batch_size:(idx + 1) * self.batch_size]
+        batch_x = self.x[batch_idx]
+        batch_y = self.y[batch_idx]
 
-        X = np.array([imread(file_name) for file_name in batch_x], dtype='uint8')
         if self.augmenter is not None:
-            X = self.augmenter(images=X)
+            batch_x = self.augmenter(images=batch_x)
 
-        Y = np.eye(self.num_classes)[batch_y]
-        W = self.weights[self.y[batch_y]]
+        batch_y = np.eye(self.num_classes)[batch_y]
 
-        return X, Y, W
+        return batch_x, batch_y
 
 
-def improve_detections(image, detections, cls_model, crop_size, num_classes, rbc_threshold=0.95):
+def improve_detections(image, detections, cls_model, crop_size, num_classes):
     detections_stack = np.vstack(detections)
     boxes = detections_stack[:, :4]
     labels = np.zeros((boxes.shape[0],))
     scores = np.zeros((boxes.shape[0],))
-    not_duplicate = np.full((boxes.shape[0],), True)
+    true_positives = np.full((boxes.shape[0],), True)
 
-    for box_label in range(num_classes):
-        for i, box in enumerate(detections[box_label]):
-            box, box_score = box[:4], box[4]
-            if box_label == 2 and box_score > rbc_threshold:
-                # RBC
-                labels[i] = box_label
-                scores[i] = box_score
-                continue
+    for i, box in enumerate(boxes):
+        xmin, ymin, xmax, ymax = list(map(int, box))
+        crop = image[ymin:ymax, xmin:xmax]
+        crop = resize(crop, (crop_size[1], crop_size[0]), preserve_range=True)
 
-            # Detect other classes
-            xmin, ymin, xmax, ymax = list(map(int, box))
-            crop = image[ymin:ymax, xmin:xmax]
-            crop = resize(crop, (crop_size[1], crop_size[0]), preserve_range=True)
+        y_pred = cls_model.predict(crop[np.newaxis, ...])[0]
+        label = np.argmax(y_pred)
 
-            y_pred = cls_model.predict(crop[np.newaxis, ...])[0]
-            label = np.argmax(y_pred)
+        if label == num_classes - 1:
+            true_positives[i] = False
+            continue
 
-            if label == num_classes - 1:
-                not_duplicate[i] = False
-                continue
+        labels[i] = label
+        scores[i] = y_pred[label]
 
-            labels[i] = label
-            scores[i] = y_pred[label]
-
-    boxes = boxes[not_duplicate]
-    labels = labels[not_duplicate]
-    scores = scores[not_duplicate]
+    boxes = boxes[true_positives]
+    labels = labels[true_positives]
+    scores = scores[true_positives]
 
     new_detections = [None for _ in range(num_classes)]
     for label in range(num_classes):
@@ -191,5 +194,3 @@ def improve_detections(image, detections, cls_model, crop_size, num_classes, rbc
         new_detections[label] = np.concatenate([boxes[idx], np.expand_dims(scores[idx], axis=1)], axis=1)
 
     return new_detections
-
-
